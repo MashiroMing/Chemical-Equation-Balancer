@@ -9,6 +9,15 @@ a = Analysis(
         'tkinter',
         'tkinter.messagebox',
         'tkinter.scrolledtext',
+        'tkinter.filedialog',
+        # Pillow 图片导出
+        'PIL',
+        'PIL.Image',
+        'PIL.ImageDraw',
+        'PIL.ImageFont',
+        'PIL.ImageTk',
+        'PIL._imagingtk',
+        'PIL._tkinter_finder',
     ],
     hookspath=[],
     hooksconfig={},
@@ -16,27 +25,22 @@ a = Analysis(
     excludes=[
         # 科学计算
         'numpy', 'scipy', 'pandas', 'matplotlib',
-        # 图形与图像
-        'PIL', 'Pillow', 'cv2', 'cairo',
+        # 图形与图像（保留 Pillow，仅排除不需要的）
+        'cv2', 'cairo',
         # GUI 框架（非 tkinter）
         'wx', 'PyQt5', 'PySide2', 'PySide6', 'PyQt6', 'kivy',
         # 网络
-        'urllib3', 'requests', 'aiohttp', 'http', 'xmlrpc',
+        'urllib3', 'requests', 'aiohttp', 'xmlrpc',
         # 数据库
         'sqlite3', 'sqlalchemy', 'pymongo',
         # 邮件
-        'email', 'smtplib', 'poplib', 'imaplib',
+        'smtplib', 'poplib', 'imaplib',
         # 其他大模块
         'curses', 'ctypes.test', 'distutils', 'setuptools',
         'test', 'unittest', 'doctest', 'pdb',
         'multiprocessing', 'concurrent.futures',
-        'asyncio', 'logging', 'argparse',
+        'asyncio', 'argparse',
         'ssl', 'socket', 'ftplib',
-        'xml', 'html', 'csv',
-        'pickle', 'shelve',
-        'bz2', 'lzma', 'zlib', 'gzip', 'tarfile',
-        'hashlib', 'hmac',
-        'calendar', 'datetime',  # keep datetime? Actually it's small, keep it
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
@@ -62,7 +66,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=r'c:\Users\Benjiamin\Desktop\小工具\icon.ico',
+    icon=r'icon.ico',
 )
 
 coll = COLLECT(

@@ -487,37 +487,31 @@ def _term_to_unicode(term: str) -> str:
     """
     将单个化学式项（如 Fe2+、MnO4-、H2O）转换为 Unicode 角标格式。
     前置系数（如 5Fe2+ 中的 5）保持平排，不转上下标。
-    启发式规则：单元素离子 → 数字作为电荷上标；多元素 → 数字作为下标，
-    仅末尾的正负号上标。
+    利用 disambiguate_charge 正确区分原子下标与电荷数字：
+      Fe2+ → Fe²⁺, CO32- → CO₃²⁻, Cr2O72- → Cr₂O₇²⁻
     """
     # 分离前置系数
     m = re.match(r'(\d*)(.*)', term)
     coeff = m.group(1)
     formula = m.group(2)
 
-    m = re.search(r'(\d*)([+-]+)$', formula)
-    if not m:
-        return coeff + _digits_to_sub(formula)
+    # 利用已有的电荷解析器获取正确的 base / charge 分割
+    base, charge_val = disambiguate_charge(formula)
 
-    charge_digits = m.group(1)
-    charge_signs = m.group(2)
-    body = formula[:m.start()]
+    # base 中的数字 → 下标
+    body_unicode = _digits_to_sub(base)
 
-    if charge_digits:
-        # 数一数主体中的大写字母（即几种元素）
-        upper_count = len(set(re.findall(r'[A-Z]', body)))
-        if upper_count <= 1:
-            # 单元素离子：Fe2+ → Fe²⁺, Mn2+ → Mn²⁺, S2- → S²⁻
-            body_unicode = _digits_to_sub(body)
-            charge_unicode = _digits_to_super(charge_digits) + _signs_to_super(charge_signs)
-        else:
-            # 多元素：MnO4- → MnO₄⁻, Cr2O72- → Cr₂O₇₂⁻
-            body_unicode = _digits_to_sub(body + charge_digits)
-            charge_unicode = _signs_to_super(charge_signs)
+    # 中性分子，直接返回
+    if charge_val == 0:
+        return coeff + body_unicode
+
+    # 电荷 → 上标
+    sign = '+' if charge_val > 0 else '-'
+    abs_val = abs(charge_val)
+    if abs_val > 1:
+        charge_unicode = _digits_to_super(str(abs_val)) + _signs_to_super(sign)
     else:
-        # 仅有正负号：H+ → H⁺
-        body_unicode = _digits_to_sub(body)
-        charge_unicode = _signs_to_super(charge_signs)
+        charge_unicode = _signs_to_super(sign)
 
     return coeff + body_unicode + charge_unicode
 
@@ -834,7 +828,7 @@ def gui_main():
             "   · 化学式须严格区分大小写（Co 为钴，CO 为一氧化碳）。\n"
             "   · 输入框中请勿添加前置系数（如 2H2O），程序自动计算。\n"
             "   · 无解或歧义时，结果区会以红色字体提示错误。\n"
-            "   · 分子式列表保存在同目录的 custom_formulas.json 文件中。\n\n")
+            "   · 用户在“自定义分子式”输入和保存的分子式会保留。\n\n")
 
         guide.insert(tk.END, "─" * 52 + "\n")
         guide.insert(tk.END, "作者：张曾继明\n")

@@ -34,7 +34,7 @@ python balancer.py
 
 ### 方式二：使用打包好的 exe（Windows）
 
-下载 Release 中的 `化学方程式配平工具.exe`，双击运行。
+下载 .7z文件 中的 `化学方程式配平工具.exe`，双击运行。
 
 ## 使用说明
 

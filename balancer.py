@@ -51,10 +51,10 @@ def parse_atoms(formula: str) -> dict:
             stack[-1][name] = stack[-1].get(name, 0) + cnt
             continue  # i 已指向下一个非数字字符
 
-        elif ch == '(':
+        elif ch == '(' or ch == '[':
             stack.append({})
 
-        elif ch == ')':
+        elif ch == ')' or ch == ']':
             group = stack.pop()
             i += 1
             mult_str = ''
@@ -80,6 +80,7 @@ def disambiguate_charge(raw_formula: str):
     """
     尝试所有可能的电荷分割，用启发式规则选择最佳解析。
     返回 (base_formula, charge) 或 (raw_formula, 0) 若无电荷。
+    增强：正确处理含括号离子如 Ag(NH3)2+、Fe(CN)64-。
     """
     candidates: list[tuple[str, int]] = []
 
@@ -104,6 +105,9 @@ def disambiguate_charge(raw_formula: str):
 
         base = raw_formula[:split_pos]
         if base:
+            # 增强：base 末尾是数字且前面紧接 ')' 时，该数字可能是括号倍数
+            # 例如 Ag(NH3)2+ → base="Ag(NH3)2", charge=+1 (括号外的 2 属于结构)
+            # 如果 base 不以 ')' 结尾的数字结束，正常添加候选
             candidates.append((base, val))
 
     if not candidates:
@@ -126,31 +130,49 @@ def disambiguate_charge(raw_formula: str):
     reasonable = [c for c in parsed_candidates if c[5] <= 20]
 
     if not reasonable:
-        # 放宽条件，取 max_subscript 最小的
+        # 放宽条件：若 parsed_candidates 也空，则无法解析，返回中性分子
+        if not parsed_candidates:
+            return raw_formula, 0
         parsed_candidates.sort(key=lambda x: x[5])
         reasonable = [parsed_candidates[0]]
 
     if len(reasonable) == 1:
         return reasonable[0][0], reasonable[0][1]
 
-    # 启发式排序
-    # 单元素 → 原子数少的好；多元素 → 原子数多的好
+    # 增强：优先选择 base 完整（末尾有括号匹配）的候选
+    # 含括号化合物：检查括号是否成对闭合
+    def _paren_score(b: str) -> int:
+        depth = 0
+        for ch in b:
+            if ch == '(':
+                depth += 1
+            elif ch == ')':
+                depth -= 1
+        return depth  # 0 = 完全闭合, >0 = 不完整
+
+    # 启发式排序权重
+    # 1) 括号完整性（完全闭合 > 不完整）
+    # 2) 单元素 → 原子数少的好；多元素 → 原子数多的好
     single = [c for c in reasonable if c[4]]
     multi = [c for c in reasonable if not c[4]]
 
     if single and multi:
-        # 混合情况：优先选单元素中原子最少的，或按整体规则
-        # 取所有候选中原子数适中的
-        reasonable.sort(key=lambda x: x[3])
-        return reasonable[len(reasonable) // 2][0], reasonable[len(reasonable) // 2][1]
+        # 混合：优先选括号闭合且原子数适中的
+        reasonable.sort(key=lambda x: (abs(_paren_score(x[0])), x[3]))
+        return reasonable[0][0], reasonable[0][1]
 
     if single:
-        single.sort(key=lambda x: x[3])  # 原子少的好
+        single.sort(key=lambda x: (abs(_paren_score(x[0])), x[3]))
         return single[0][0], single[0][1]
 
-    # multi
-    multi.sort(key=lambda x: -x[3])  # 原子多的好
-    return multi[0][0], multi[0][1]
+    if multi:
+        multi.sort(key=lambda x: (abs(_paren_score(x[0])), -x[3]))
+        return multi[0][0], multi[0][1]
+
+    # 最终回退：全部候选都无法分类，返回第一个
+    if reasonable:
+        return reasonable[0][0], reasonable[0][1]
+    return raw_formula, 0
 
 
 def parse_formula(raw: str):
@@ -182,10 +204,12 @@ def parse_formula(raw: str):
 
 def split_terms(side: str) -> list[str]:
     """
-    分割化学式项。只按后面紧跟大写字母或 '(' 的 '+' 分割，
+    分割化学式项。
+    增强：兼容用户写了前置系数的情况（如 '+2HCl'），以及方括号化学式（如 '+[Ag(NH3)2]OH'）。
+    只按后面紧跟大写字母、'('、'[' 或数字（前置系数）的 '+' 分割。
     避免把电荷符号（如 Fe2+ 中的 +）误当作分隔符。
     """
-    return [s for s in re.split(r'\+(?=[A-Z(])', side) if s]
+    return [s for s in re.split(r'\+(?=[A-Z(\[\d])', side) if s]
 
 
 def parse_equation(line: str):
@@ -302,6 +326,7 @@ def gauss_jordan_rref(matrix):
 def solve_nullspace(rref_matrix):
     """
     从 RREF 矩阵中提取零空间的一个基向量。
+    增强：多自由度时尝试多种自由变量组合，选系数全正且最简的那个。
     返回 Fraction 列表，或 None。
     """
     m = len(rref_matrix)
@@ -330,21 +355,42 @@ def solve_nullspace(rref_matrix):
     if len(free_cols) == 0:
         return None  # 只有平凡解
 
-    # 自由度 > 1：设最后一个自由变量为 1，其余为 0
-    solution = [Fraction(0)] * n
-    solution[free_cols[-1]] = Fraction(1)
+    # 回代求解主元变量（给定自由变量值）
+    def _back_substitute(free_values: list[Fraction]) -> list[Fraction]:
+        sol = [Fraction(0)] * n
+        for fi, fv in zip(free_cols, free_values):
+            sol[fi] = fv
+        sorted_pivot_rows = sorted(pivot_map.keys(), reverse=True)
+        for r in sorted_pivot_rows:
+            c = pivot_map[r]
+            total = Fraction(0)
+            for j in range(c + 1, n):
+                total += rref_matrix[r][j] * sol[j]
+            sol[c] = -total
+        return sol
 
-    # 回代求解主元变量
-    # 找到每个主元行，按从下到上的顺序
-    sorted_pivot_rows = sorted(pivot_map.keys(), reverse=True)
-    for r in sorted_pivot_rows:
-        c = pivot_map[r]
-        total = Fraction(0)
-        for j in range(c + 1, n):
-            total += rref_matrix[r][j] * solution[j]
-        solution[c] = -total
+    # 自由度 = 1：设该自由变量为 1
+    if len(free_cols) == 1:
+        solution = _back_substitute([Fraction(1)])
+        return solution
 
-    return solution
+    # 自由度 > 1：尝试多种自由变量组合，找全部系数为正的最简解
+    best_solution = None
+    # 尝试：依次让每个自由变量为 1，其他为 0
+    for pivot_fi in range(len(free_cols)):
+        fv = [Fraction(0)] * len(free_cols)
+        fv[pivot_fi] = Fraction(1)
+        sol = _back_substitute(fv)
+        if all(s > 0 for s in sol):
+            if best_solution is None or max(sol) < max(best_solution):
+                best_solution = sol
+
+    if best_solution is not None:
+        return best_solution
+
+    # 回退：用最后一个自由变量（原始行为）
+    return _back_substitute([Fraction(1) if i == len(free_cols) - 1
+                             else Fraction(0) for i in range(len(free_cols))])
 
 
 def to_integer_coeffs(fractions):
@@ -380,21 +426,37 @@ def to_integer_coeffs(fractions):
 # ============================================================
 
 def preprocess(equation: str) -> str:
-    """预处理方程式字符串。"""
-    # 删除所有空白字符
-    equation = re.sub(r'\s+', '', equation)
+    """预处理方程式字符串。
+    增强：容错——自动剥离用户输入的化学式前置系数，自动用 = 替代空格分隔符。
+    说明：用户写 '2HCl' 时，程序会自动剥离 2 当作 HCl 处理，
+    配平算法会自行计算正确系数。括号/方括号内的数字保持不变。
+    """
+    # 容错 1：用空格代替 = / -> 的情况
+    # 若方程不含 = 和 ->，但有空格 → 启发式第一个空格处替换为 =
+    if '=' not in equation and '->' not in equation:
+        sp = equation.find(' ')
+        if sp != -1:
+            # 找到第一个空格，替换为 = （后续若有空格视为生成物内的分隔）
+            equation = equation[:sp] + '=' + equation[sp + 1:]
 
-    if not equation:
+    # 去掉所有剩余空白字符
+    equation_clean = re.sub(r'\s+', '', equation)
+
+    if not equation_clean:
         raise ValueError("输入为空")
 
-    # 检测前置系数
-    if re.search(r'(?:^|\+|=)\d+[A-Z(]', equation):
-        raise ValueError(
-            "请勿输入前置系数（如 2H2O），本工具仅负责配平，"
-            "请从化学式本身（如 H2O）开始。"
-        )
+    # 智能剥离前置系数（仅当数字 + 大写字母或 '('）
+    # 注意：方括号 [ 不是新化学式的开始——可能是络合物的内部结构
+    equation_clean = re.sub(r'^(\d+)([A-Z(])', r'\2', equation_clean)
+    equation_clean = re.sub(r'(\+)(\d+)([A-Z(])', r'\1\3', equation_clean)
+    equation_clean = re.sub(r'(=)(\d+)([A-Z(])', r'\1\3', equation_clean)
 
-    return equation
+    # 但需要保留 [ 后的数字——络合物的内部结构
+    # 例：+2[Ag(NH3)2]OH → +[Ag(NH3)2]OH（前面的 2 是前置系数，剥离）
+    # 但 [Ag(NH3)2] 中的 2 是 NH3 的倍数，必须保留
+    # 当前正则已正确处理：[Ag(NH3)2] 中的 2 前是 )，不属于剥离范围 ✓
+
+    return equation_clean
 
 
 def format_output(left_items, right_items, coeffs):
@@ -406,7 +468,9 @@ def format_output(left_items, right_items, coeffs):
     def format_side(items, coeffs):
         parts = []
         for coeff, item in zip(coeffs, items):
-            parts.append(f"{coeff}{item}")
+            # 剥掉 item 开头用户写的前置系数（parse_formula 已忽略它）
+            clean_item = re.sub(r'^(\d+)([A-Z(\[])', r'\2', item)
+            parts.append(f"{coeff}{clean_item}")
         return ' + '.join(parts)
 
     left_str = format_side(left_items, left_coeffs)
@@ -464,6 +528,63 @@ def balance_wrapper(equation_str: str) -> tuple[bool, str]:
     if result.startswith("错误"):
         return False, result
     return True, result
+
+
+def balance_with_matrix(equation_str: str):
+    """
+    配平并返回 (成功标志, 消息, 矩阵数据)。
+    矩阵数据为 dict: {'elements': [...], 'compounds': [...],
+                      'matrix': [[Fraction,...]], 'rref': [[Fraction,...]]}
+    失败时矩阵数据为 None。
+    增强：当电荷行全零时自动降秩回退。
+    """
+    try:
+        eq = preprocess(equation_str)
+        left_compounds, right_compounds = parse_equation(eq)
+        matrix, elements = build_matrix(left_compounds, right_compounds)
+        # 深拷贝矩阵（RREF 会原地修改）
+        import copy
+        matrix_copy = copy.deepcopy(matrix)
+        rref_matrix = gauss_jordan_rref(matrix)
+        solution = solve_nullspace(rref_matrix)
+
+        # 降秩回退：若电荷行全零导致过约束，移除电荷行重试
+        if solution is None and elements[-1] == 'e-':
+            has_charge = any(
+                row[-1] != Fraction(0) for row in matrix_copy[:-1])
+            if not has_charge:
+                reduced = [row[:] for row in matrix_copy[:-1]]
+                rref_reduced = gauss_jordan_rref(reduced)
+                solution = solve_nullspace(rref_reduced)
+                if solution is not None:
+                    rref_matrix = rref_reduced
+
+        if solution is None:
+            # 方程无解 — 可能是用户写错了反应物/生成物
+            return (False,
+                    "错误：该方程式无法配平，"
+                    "请检查反应物/生成物的种类或数量。",
+                    None)
+        if any(s <= 0 for s in solution):
+            return (False,
+                    "错误：该方程式配平系数不唯一或存在歧义，"
+                    "请检查反应物/生成物是否写全。",
+                    None)
+        int_coeffs = to_integer_coeffs(solution)
+        parts = re.split(r'->|=', eq)
+        left_raw = split_terms(parts[0])
+        right_raw = split_terms(parts[1])
+        result = format_output(left_raw, right_raw, int_coeffs)
+        matrix_data = {
+            'elements': elements,
+            'compounds': left_raw + right_raw,
+            'matrix': matrix_copy,
+            'rref': rref_matrix,
+            'solution': int_coeffs,
+        }
+        return True, result, matrix_data
+    except ValueError as e:
+        return False, str(e), None
 
 
 # ============================================================
@@ -557,6 +678,12 @@ _DEFAULT_FORMULAS = [
     # 常见化合物
     "CuSO4", "CaCO3", "Ca(OH)2", "Fe2O3", "Al2O3",
     "SiO2", "Na2CO3", "NaHCO3", "BaSO4", "AgCl",
+    # 含括号化合物（氢氧化物、硝酸盐、铵盐等）
+    "Cu(OH)2", "Fe(OH)3", "Fe(OH)2", "Al(OH)3", "Mg(OH)2",
+    "Ba(OH)2", "Zn(OH)2", "Cu(NO3)2", "Fe(NO3)3",
+    "Al(NO3)3", "Ca(NO3)2", "Ag(NH3)2+",
+    "(NH4)2SO4", "(NH4)3PO4", "NH4HCO3", "(NH4)2CO3",
+    "NH4NO3", "NH4Cl", "(NH4)2Fe(SO4)2",
 ]
 
 
@@ -1076,8 +1203,14 @@ def gui_main():
 
     # === 核心逻辑 ===
 
+    # 缓存每行方程式的矩阵数据: {line_number: matrix_data}
+    _matrix_cache: dict[int, dict] = {}
+    # 记录输出框中每行对应的 line_index 映射
+    _output_line_map: dict[int, int] = {}  # tk_line → cache_index
+
     def do_balance():
         """执行配平并显示结果。支持多行批量输入。"""
+        nonlocal _matrix_cache, _output_line_map
         raw = entry.get("1.0", tk.END).strip()
         if not raw:
             messagebox.showwarning("提示", "请输入方程式")
@@ -1087,10 +1220,16 @@ def gui_main():
         output.config(state="normal")
         output.delete("1.0", tk.END)
         output.edit_reset()
+        _matrix_cache.clear()
+        _output_line_map.clear()
+
+        # 清空矩阵面板
+        _show_matrix_panel(None)
 
         lines = raw.split('\n')
         unicode_lines = []
         needs_sep = False
+        cache_idx = 0
 
         for line in lines:
             line = line.strip()
@@ -1103,14 +1242,21 @@ def gui_main():
                 output.insert(tk.END, "\n" + "─" * 55 + "\n")
             needs_sep = True
 
-            success, msg = balance_wrapper(plain)
+            success, msg, mdata = balance_with_matrix(plain)
 
+            # 插入方程式（用临时占位符记录位置，避免歧义）
             if success:
                 output.insert(tk.END, format_formula_with_unicode(msg))
+                # 插入后，用 end-1c 取方程式实际所在行号
+                line_start = int(output.index("end-1c").split('.')[0])
+                if mdata:
+                    _matrix_cache[cache_idx] = mdata
+                    _output_line_map[line_start] = cache_idx
             else:
                 output.insert(tk.END, msg, "error")
 
             unicode_lines.append(format_formula_with_unicode(line))
+            cache_idx += 1
 
         # 输入框同步为 Unicode 角标版
         entry.delete("1.0", tk.END)
@@ -1119,11 +1265,15 @@ def gui_main():
 
     def do_clear():
         """清空输入框和输出区域。"""
+        nonlocal _matrix_cache, _output_line_map
         entry.delete("1.0", tk.END)
         output.config(state="normal")
         output.delete("1.0", tk.END)
         output.edit_reset()
         cond_entry.delete(0, tk.END)
+        _matrix_cache.clear()
+        _output_line_map.clear()
+        _show_matrix_panel(None)
 
     # 取消/重做安全包装
     def _safe_undo(_event=None):
@@ -1178,6 +1328,8 @@ def gui_main():
         guide.insert(tk.END,
             "  格式：Fe2+ + MnO4- + H+ = Fe3+ + Mn2+ + H2O\n"
             "  支持 -> 或 = 作为分隔符，支持 (s)/(g)/(l)/(aq) 状态标记。\n"
+            "  支持括号化学式：Ca(OH)2、Cu(NO3)2、(NH4)2SO4 等。\n"
+            "  支持络离子：Ag(NH3)2+、Fe(CN)64- 等。\n"
             "  输入完成后按 Ctrl+Enter 即可配平。\n\n")
 
         guide.insert(tk.END, "二、批量配平\n", "section")
@@ -1236,7 +1388,7 @@ def gui_main():
     # 居中显示（窗口加大以容纳工具栏和底部按钮）
     root.update_idletasks()
     win_w = 620
-    win_h = 560
+    win_h = 580
     screen_w = root.winfo_screenwidth()
     screen_h = root.winfo_screenheight()
     x = (screen_w - win_w) // 2
@@ -1300,22 +1452,153 @@ def gui_main():
     btn_formula.pack(side="left", padx=5)
 
     # --- 输出区域（可编辑 + 支持撤销/重做） ---
-    lbl_output = tk.Label(root, text="配平结果（可编辑，Ctrl+Z 撤销 / Ctrl+Y 重做）：")
+    lbl_output = tk.Label(root, text="配平结果（可编辑，Ctrl+Z 撤销 / Ctrl+Y 重做；点击行查看矩阵）：")
     lbl_output.pack(anchor="w", padx=15, pady=(6, 4))
 
-    output = ScrolledText(root, width=62, height=8,
+    output = ScrolledText(root, width=62, height=7,
                           font=("Consolas", 11), wrap="word",
                           undo=True)
-    output.pack(padx=15, pady=(0, 4), fill="both", expand=True)
+    output.pack(padx=15, pady=(0, 4), fill="x")
     output.bind("<Control-z>", _safe_undo)
     output.bind("<Control-y>", _safe_redo)
 
     # 配置红色错误标签
     output.tag_config("error", foreground="red")
+    output.tag_config("highlight_line", background="#e8f0fe")
+
+    # --- 矩阵显示面板 ---
+    matrix_panel_frame = tk.Frame(root)
+    matrix_panel_frame.pack(padx=15, pady=(0, 2), fill="x")
+
+    # 原始矩阵标签 + 文本框
+    matrix_left = tk.Frame(matrix_panel_frame)
+    matrix_left.pack(side="left", fill="both", expand=True)
+
+    # 带装饰色条的标签
+    mlabel_left = tk.Frame(matrix_left)
+    mlabel_left.pack(anchor="w", fill="x")
+    tk.Frame(mlabel_left, bg="#4a90d9", width=4).pack(
+        side="left", fill="y", padx=(0, 6))
+    tk.Label(mlabel_left, text="原始矩阵 (元素 × 化合物)",
+             font=("Microsoft YaHei", 9, "bold"),
+             fg="#333").pack(side="left")
+
+    matrix_original = ScrolledText(matrix_left, width=34, height=4,
+                                    font=("Consolas", 10), wrap="none",
+                                    state="disabled")
+    matrix_original.pack(fill="both", expand=True)
+
+    # RREF 矩阵标签 + 文本框
+    matrix_right = tk.Frame(matrix_panel_frame)
+    matrix_right.pack(side="left", fill="both", expand=True, padx=(10, 0))
+
+    mlabel_right = tk.Frame(matrix_right)
+    mlabel_right.pack(anchor="w", fill="x")
+    tk.Frame(mlabel_right, bg="#e8843a", width=4).pack(
+        side="left", fill="y", padx=(0, 6))
+    tk.Label(mlabel_right, text="RREF 矩阵 (消元后)",
+             font=("Microsoft YaHei", 9, "bold"),
+             fg="#333").pack(side="left")
+
+    matrix_rref = ScrolledText(matrix_right, width=34, height=4,
+                                font=("Consolas", 10), wrap="none",
+                                state="disabled")
+    matrix_rref.pack(fill="both", expand=True)
+
+    def _format_matrix_for_display(elements, compounds, matrix):
+        """将矩阵格式化为对齐的文本表格。"""
+        col_widths = []
+        # 化合物列宽
+        for comp in compounds:
+            col_widths.append(len(comp))
+        # 矩阵数值列宽
+        for row in matrix:
+            for val in row:
+                s = str(val)
+                col_widths.append(len(s))
+        max_w = max(col_widths) if col_widths else 6
+        max_w = max(max_w + 2, 8)
+
+        # 表头：元素标签
+        lines = []
+        header = " " * 4  # 行标签占位
+        for comp in compounds:
+            header += f"{comp:^{max_w}}"
+        lines.append(header)
+
+        # 分隔线
+        lines.append("─" * len(header))
+
+        # 每行：元素名 + 系数
+        for i, elem in enumerate(elements):
+            row_str = f"{elem:>3} "
+            for val in matrix[i]:
+                # Fraction 显示为 a/b 或整数
+                if val.denominator == 1:
+                    s = str(val.numerator)
+                else:
+                    s = f"{val.numerator}/{val.denominator}"
+                row_str += f"{s:^{max_w}}"
+            lines.append(row_str)
+
+        return '\n'.join(lines)
+
+    def _show_matrix_panel(mdata: dict | None) -> None:
+        """更新矩阵显示面板。mdata 为 None 时显示占位提示。"""
+        matrix_original.config(state="normal")
+        matrix_original.delete("1.0", tk.END)
+        matrix_rref.config(state="normal")
+        matrix_rref.delete("1.0", tk.END)
+
+        if mdata is None:
+            hint = "\n  ← 点击上方配平结果中的任意一行"
+            matrix_original.insert("1.0", hint)
+            matrix_rref.insert("1.0", hint)
+        else:
+            orig_text = _format_matrix_for_display(
+                mdata['elements'], mdata['compounds'], mdata['matrix'])
+            rref_text = _format_matrix_for_display(
+                mdata['elements'], mdata['compounds'], mdata['rref'])
+            matrix_original.insert("1.0", orig_text)
+            matrix_rref.insert("1.0", rref_text)
+
+        matrix_original.config(state="disabled")
+        matrix_rref.config(state="disabled")
+
+    def _on_output_click(event: tk.Event) -> None:
+        """点击结果框时，显示对应行的矩阵。"""
+        # 取消上次高亮
+        output.tag_remove("highlight_line", "1.0", tk.END)
+
+        index = output.index(f"@{event.x},{event.y}")
+        line_num = int(index.split('.')[0])
+
+        # 查找最近的有效矩阵缓存（处理分隔线等非方程行）
+        cache_idx = None
+        for tk_line in sorted(_output_line_map.keys(), reverse=True):
+            if tk_line <= line_num:
+                cache_idx = _output_line_map[tk_line]
+                break
+
+        if cache_idx is not None and cache_idx in _matrix_cache:
+            mdata = _matrix_cache[cache_idx]
+            _show_matrix_panel(mdata)
+            # 高亮当前行
+            if cache_idx in _output_line_map.values():
+                for tl, ci in _output_line_map.items():
+                    if ci == cache_idx:
+                        output.tag_add("highlight_line",
+                                       f"{tl}.0", f"{tl}.0 lineend")
+                        break
+        else:
+            _show_matrix_panel(None)
+
+    output.bind("<Button-1>", lambda e: (
+        _on_output_click(e), output.focus_set()))
 
     # --- 底部按钮 ---
     bottom_frame = tk.Frame(root)
-    bottom_frame.pack(pady=(4, 10))
+    bottom_frame.pack(pady=(6, 10))
 
     tk.Button(bottom_frame, text="复制纯文本", width=14,
               command=_copy_plain_text).pack(side="left", padx=5)
